@@ -1,0 +1,106 @@
+import pandas as pd
+import numpy as np
+import matplotlib.pyplot as plt
+import statsmodels.api as sm
+from scipy import stats
+import wrds
+import dask.dataframe as dd  # Using Dask for large data handling
+
+# Connect to WRDS securely
+try:
+    conn = wrds.Connection()
+except Exception as e:
+    print(f"WRDS Connection failed: {e}")
+
+# Load Fama-French factors
+official_factors = pd.read_csv("F-F_Research_Data_Factors.CSV", skiprows=3)
+official_factors = official_factors.dropna().reset_index(drop=True)
+
+# Load risk-free rate data
+risk_free = pd.read_csv("DGS10.csv")
+
+# Pull Compustat data from WRDS
+comp = conn.raw_sql("""
+    SELECT gvkey, datadate, at, pstkl, txditc, pstkrv, seq, pstk
+    FROM comp.funda
+    WHERE indfmt='INDL' AND datafmt='STD' AND popsrc='D' AND consol='C'
+    AND datadate >= '01/01/1959'
+""", date_cols=['datadate'])
+
+comp['year'] = comp['datadate'].dt.year
+
+# Reduce Data Size Before Merging
+comp = comp[['gvkey', 'datadate', 'seq', 'txditc', 'pstkl', 'pstkrv', 'pstk']]
+
+# Calculate Preferred Stock and Book Equity
+comp['ps'] = np.where(comp['pstkrv'].isnull(), comp['pstkl'], comp['pstkrv'])
+comp['ps'] = np.where(comp['ps'].isnull(), comp['pstk'], comp['ps'])
+comp['ps'] = np.where(comp['ps'].isnull(), 0, comp['ps'])
+comp['txditc'] = comp['txditc'].fillna(0)
+comp['be'] = comp['seq'] + comp['txditc'] - comp['ps']
+comp.loc[comp['be'] <= 0, 'be'] = np.nan  # Remove negative book equity
+
+# Load CRSP data using Pandas
+crsp_m = pd.read_csv("C:/Users/conno/OneDrive/Ken French data/crsp_m.csv", parse_dates=["mthcaldt"])
+print(crsp_m.dtypes)  # Verify that mthcaldt is datetime64[ns]
+
+# Ensure correct data types
+crsp_m['permno'] = crsp_m['permno'].astype(int)
+comp['gvkey'] = comp['gvkey'].astype(str)
+
+# Compute Market Equity (ME)
+crsp_m['me'] = crsp_m['mthprc'].abs() * crsp_m['shrout']
+
+# Link CRSP and Compustat Data
+link_table = conn.raw_sql("""
+    SELECT lpermno AS permno, gvkey, linktype, linkprim, linkdt, linkenddt
+    FROM crsp.ccmxpf_linktable
+    WHERE linktype IN ('LU', 'LC')  -- Only active links
+""")
+
+comp = comp.merge(link_table, on="gvkey", how="left")
+
+# Merge Data
+crsp_comp = crsp_m.merge(comp, on=['permno'], how='inner')
+
+# Compute B/M Ratio
+crsp_comp['be_me'] = crsp_comp['be'] / crsp_comp['me']
+
+# Portfolio Sorting
+median_me = crsp_comp.groupby('mthcaldt')['me'].median()
+crsp_comp['size_group'] = crsp_comp.apply(lambda x: 'Small' if x['me'] <= median_me[x['mthcaldt']] else 'Big', axis=1)
+
+terciles = crsp_comp.groupby('mthcaldt')['be_me'].quantile([0.3, 0.7]).unstack()
+crsp_comp['hml_group'] = crsp_comp.apply(
+    lambda x: 'Growth' if x['be_me'] <= terciles.loc[x['mthcaldt'], 0.3] else ('Value' if x['be_me'] >= terciles.loc[x['mthcaldt'], 0.7] else 'Neutral'),
+    axis=1
+)
+
+# Calculate SMB & HML Factors
+smb = crsp_comp.groupby(['mthcaldt', 'size_group'])['mthret'].mean().unstack()
+hml = crsp_comp.groupby(['mthcaldt', 'hml_group'])['mthret'].mean().unstack()
+
+smb_factor = smb['Small'] - smb['Big']
+hml_factor = hml['Value'] - hml['Growth']
+
+# Merge Factors for Regression
+factors_df = pd.DataFrame({'SMB': smb_factor, 'HML': hml_factor}).reset_index()
+market_excess_return = official_factors.iloc[:, 1] - official_factors.iloc[:, 3]  # Market return - Risk-Free rate
+
+# Perform Regression
+X = sm.add_constant(pd.DataFrame({'MKT': market_excess_return, 'SMB': factors_df['SMB'], 'HML': factors_df['HML']}))
+y = official_factors.iloc[:, 1]  # Market return
+model = sm.OLS(y, X, missing='drop').fit()
+
+# Print Regression Results
+print(model.summary())
+
+# Visualization
+plt.figure(figsize=(10, 5))
+plt.plot(factors_df['mthcaldt'], factors_df['SMB'], label='SMB Factor')
+plt.plot(factors_df['mthcaldt'], factors_df['HML'], label='HML Factor')
+plt.xlabel("Date")
+plt.ylabel("Factor Value")
+plt.legend()
+plt.title("Fama-French Factor Trends")
+plt.show()
